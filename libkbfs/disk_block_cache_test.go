@@ -582,11 +582,11 @@ func TestDiskBlockCacheWithRetrievalQueue(t *testing.T) {
 
 func seedDiskBlockCacheForTest(
 	t *testing.T, ctx context.Context, cache *diskBlockCacheWrapped,
-	config diskBlockCacheConfig, numTlfs, numBlocksPerTlf int) {
+	config diskBlockCacheConfig, numTlfs, numBlocksPerTlf int, tlfType tlf.Type) {
 	t.Log("Seed the cache with some blocks.")
 	clock := config.Clock().(*TestClock)
 	for i := byte(0); int(i) < numTlfs; i++ {
-		currTlf := tlf.FakeID(i, tlf.Private)
+		currTlf := tlf.FakeID(i, tlfType)
 		for j := 0; j < numBlocksPerTlf; j++ {
 			blockPtr, _, blockEncoded, serverHalf := setupBlockForDiskCache(
 				t, config)
@@ -610,7 +610,8 @@ func TestSyncBlockCacheStaticLimit(t *testing.T) {
 	numTlfs := 10
 	numBlocksPerTlf := 5
 	numBlocks := numTlfs * numBlocksPerTlf
-	seedDiskBlockCacheForTest(t, ctx, cache, config, numTlfs, numBlocksPerTlf)
+	seedDiskBlockCacheForTest(t, ctx, cache, config, numTlfs,
+		numBlocksPerTlf, tlf.Private)
 
 	t.Log("Set the cache maximum bytes to the current total.")
 	require.Equal(t, 0, cache.workingSetCache.numBlocks)
@@ -708,7 +709,8 @@ func TestDiskBlockCacheUnsyncTlf(t *testing.T) {
 	numTlfs := 3
 	numBlocksPerTlf := 5
 	numBlocks := numTlfs * numBlocksPerTlf
-	seedDiskBlockCacheForTest(t, ctx, cache, config, numTlfs, numBlocksPerTlf)
+	seedDiskBlockCacheForTest(t, ctx, cache, config, numTlfs,
+		numBlocksPerTlf, tlf.Private)
 	require.Equal(t, numBlocks, standardCache.numBlocks)
 
 	tlfToUnsync := tlf.FakeID(1, tlf.Private)
@@ -757,4 +759,52 @@ func TestDiskBlockCacheMoveBlock(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, cache.syncCache.numBlocks)
 	require.Equal(t, TriggeredPrefetch, prefetchStatus)
+}
+
+func TestDiskBlockCacheHomeDirPriorities(t *testing.T) {
+	t.Parallel()
+	t.Log("Test that blocks from a home directory aren't evicted when there" +
+		" are other options.")
+	cache, config := initDiskBlockCacheTest(t)
+	defer shutdownDiskBlockCacheTest(cache)
+
+	ctx := context.Background()
+
+	t.Log("Set home directories on the cache")
+	homeTLF := tlf.FakeID(11, tlf.Private)
+	cache.AddHomeTLF(ctx, homeTLF)
+	homePublicTLF := tlf.FakeID(11, tlf.Public)
+	cache.AddHomeTLF(ctx, homePublicTLF)
+
+	t.Log("Seed the cache with blocks")
+	numTlfs := 12
+	numBlocksPerTlf := 5
+	numBlocks := numTlfs * numBlocksPerTlf * 2
+	seedDiskBlockCacheForTest(t, ctx, cache, config, numTlfs,
+		numBlocksPerTlf, tlf.Private)
+	seedDiskBlockCacheForTest(t, ctx, cache, config, numTlfs,
+		numBlocksPerTlf, tlf.Public)
+
+	countToEvict := numBlocks - numBlocksPerTlf*2 - 2
+	t.Log("Evict most of the blocks in the cache")
+	_, _, err := cache.syncCache.evictLocked(ctx, countToEvict)
+	require.NoError(t, err)
+	require.Equal(t, numBlocksPerTlf, cache.syncCache.tlfCounts[homeTLF])
+	require.Equal(t, numBlocksPerTlf, cache.syncCache.tlfCounts[homePublicTLF])
+
+	// evict the last 2 non-home-dir blocks and n-2 public homedir blocks
+	countToEvict = numBlocksPerTlf
+	t.Log("Evict most of the remaining blocks in the cache")
+	_, _, err = cache.syncCache.evictLocked(ctx, countToEvict)
+	require.NoError(t, err)
+	require.Equal(t, numBlocksPerTlf, cache.syncCache.tlfCounts[homeTLF])
+	require.Equal(t, 2, cache.syncCache.tlfCounts[homePublicTLF])
+
+	// evict the last 2 public-home-dir blocks and n-2 private homedir blocks
+	countToEvict = numBlocksPerTlf
+	t.Log("Evict most of the remaining blocks in the cache")
+	_, _, err = cache.syncCache.evictLocked(ctx, countToEvict)
+	require.NoError(t, err)
+	require.Equal(t, 2, cache.syncCache.tlfCounts[homeTLF])
+
 }
